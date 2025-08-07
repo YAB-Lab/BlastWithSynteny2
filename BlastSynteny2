@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+
+import argparse
+import subprocess
+from pathlib import Path
+from Bio import SeqIO
+import pandas as pd
+
+def run_gffread(genome_fasta, gtf_file, output_protein_fasta):
+    print(f"\n\U0001f9ec Running gffread to extract proteins from {gtf_file}\n")
+    cmd = [
+        "gffread", gtf_file,
+        "-g", genome_fasta,
+        "-y", output_protein_fasta
+    ]
+    subprocess.run(cmd, check=True)
+    print(f"\n\u2705 Protein FASTA saved to {output_protein_fasta}\n")
+
+def extract_proteins(input_fasta, id_list, output_fasta):
+    print(f"🔍 Checking for duplicate transcript IDs in {input_fasta}")
+    seen = {}
+    dedup_records = []
+    duplicate_count = 0
+
+    for record in SeqIO.parse(input_fasta, "fasta"):
+        if record.id in seen:
+            duplicate_count += 1
+            seen[record.id] += 1
+            new_id = f"{record.id}_dup{seen[record.id]}"
+            print(f"  • Duplicate found: {record.id} ➝ renamed to {new_id}")
+            record.id = new_id
+            record.description = new_id
+        else:
+            seen[record.id] = 0
+        dedup_records.append(record)
+
+    if duplicate_count > 0:
+        print(f"⚠️ Found {duplicate_count} duplicate transcript IDs. Renamed with _dup1, _dup2, etc.")
+
+    # Convert deduplicated list to a lookup dict
+    records_dict = {rec.id: rec for rec in dedup_records}
+
+    # Match by prefix to include any renamed duplicates
+    with open(output_fasta, "w") as out_f:
+        for pid in id_list:
+            matches = [rid for rid in records_dict if rid.startswith(pid)]
+            if matches:
+                for rid in matches:
+                    SeqIO.write(records_dict[rid], out_f, "fasta")
+            else:
+                print(f"⚠️ WARNING: Protein ID '{pid}' not found in {input_fasta}")
+
+    print(f"✅ Extracted protein sequences saved to {output_fasta}")
+
+
+# def extract_proteins(input_fasta, id_list, output_fasta):
+#     print(f"\n\U0001f50e Extracting specified proteins from {input_fasta}\n")
+#     records = SeqIO.to_dict(SeqIO.parse(input_fasta, "fasta"))
+#     with open(output_fasta, "w") as out_f:
+#         for pid in id_list:
+#             if pid in records:
+#                 SeqIO.write(records[pid], out_f, "fasta")
+#             else:
+#                 print(f"\n\u26a0\ufe0f WARNING: Protein ID '{pid}' not found in {input_fasta}")
+#     print(f"\n\u2705 Extracted protein sequences saved to {output_fasta}\n")
+
+def make_blast_db(fasta, dbtype="prot", log_dir=None):
+    print(f"\n\U0001f527 Creating BLAST database for {fasta}\n")
+    cmd = [
+        "makeblastdb",
+        "-in", fasta,
+        "-dbtype", dbtype
+    ]
+    if log_dir:
+        log_file = Path(log_dir) / f"makeblastdb_{Path(fasta).stem}.log"
+        with open(log_file, "w") as lf:
+            subprocess.run(cmd, check=True, stdout=lf, stderr=lf)
+    else:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"\n\u2705 BLAST database created for {fasta}\n")
+
+def run_blastp(query_fasta, db_fasta, output_file, log_dir=None):
+    print(f"\n\U0001f50d Running blastp: {query_fasta} vs {db_fasta}\n")
+    cmd = [
+        "blastp",
+        "-query", str(query_fasta),
+        "-db", str(db_fasta),
+        "-out", str(output_file),
+        "-evalue", "1e-5",
+        "-outfmt", "6",
+        "-max_target_seqs", "1",
+        "-num_threads", "4"
+    ]
+    log_file = Path(log_dir) / f"blastp_{Path(query_fasta).stem}_vs_{Path(db_fasta).stem}.log"
+    with open(log_file, "w") as lf:
+        subprocess.run(cmd, check=True, stdout=lf, stderr=lf)
+    print(f"\n\u2705 blastp completed. Output: {output_file}\n")
+
+def find_flanking_genes(gtf_file, target_id, method, window, verbose=True):
+    gtf = pd.read_csv(gtf_file, sep='\t', comment='#', header=None,
+                      names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
+    genes = gtf[gtf['type'].isin(['transcript', 'mRNA'])].copy()
+    genes['gene_id'] = genes['attributes'].str.extract('transcript_id "([^"]+)"')
+    genes = genes.dropna(subset=['gene_id']).reset_index(drop=True)
+    genes = genes.sort_values(by=['seqid', 'start']).reset_index(drop=True)
+
+    if target_id not in genes['gene_id'].values:
+        print(f"\n\u26a0\ufe0f Target ID '{target_id}' not found in GTF.\n")
+        return []
+
+    idx = genes[genes['gene_id'] == target_id].index[0]
+
+    if method == 'gene':
+        upstream = genes.iloc[max(0, idx-window):idx]
+        downstream = genes.iloc[idx+1:idx+1+window]
+    elif method == 'bp':
+        chrom = genes.loc[idx, 'seqid']
+        start = genes.loc[idx, 'start']
+        end = genes.loc[idx, 'end']
+        upstream = genes[(genes['seqid'] == chrom) & (genes['end'] < start) & (genes['end'] >= start - window)]
+        downstream = genes[(genes['seqid'] == chrom) & (genes['start'] > end) & (genes['start'] <= end + window)]
+    else:
+        raise ValueError("Method must be 'gene' or 'bp'")
+
+    flank_ids = list(upstream['gene_id']) + [target_id] + list(downstream['gene_id'])
+
+    if verbose:
+        print(f"\n\U0001f4cb Found {len(upstream)} upstream and {len(downstream)} downstream transcripts.\n")
+
+    return flank_ids
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Step 1: Extract proteins from genome and build BLAST DB")
+
+    parser.add_argument("-r", "--ref_genome", required=True, help="Reference genome FASTA file")
+    parser.add_argument("-g", "--ref_gtf", required=True, help="Reference genome GTF file")
+    parser.add_argument("-i", "--ref_ids", required=True, help="Comma-separated list of reference protein/gene IDs to extract")
+    parser.add_argument("-q", "--query_genome", required=True, help="Query genome FASTA file")
+    parser.add_argument("-t", "--query_gtf", required=True, help="Query GTF file")
+    parser.add_argument("-o", "--outdir", required=True, help="Directory to save all outputs")
+
+    parser.add_argument("-m", "--flank_method", choices=["gene", "bp"], default="gene", help="Flanking extraction method: 'gene' or 'bp' distance")
+    parser.add_argument("-w", "--window", type=int, default=5, help="Window size for flanking region (n genes or base pairs)")
+
+    return parser.parse_args()
+
+
+def summarize_query_hits(blast_file, query_gtf):
+    # Convert GFF to GTF if needed
+    gtf_path = Path(query_gtf)
+    if not gtf_path.suffix == ".gtf":
+        print(f"\n\U0001f9ec Converting query GFF to GTF format using gffread...")
+        converted_gtf = gtf_path.with_suffix(".gtf")
+        subprocess.run([
+            "gffread", str(gtf_path),
+            "-T", "-o", str(converted_gtf)
+        ], check=True)
+        query_gtf = str(converted_gtf)
+        print(f"\n✅ Converted to GTF: {query_gtf}\n")
+    print("🔎 Checking chromosome congruence of query BLAST hits...")
+
+    # Load BLAST results
+    cols = ["qseqid", "sseqid", "pident", "length", "mismatch", "gapopen",
+            "qstart", "qend", "sstart", "send", "evalue", "bitscore"]
+    blast_df = pd.read_csv(blast_file, sep="\t", header=None, names=cols)
+
+    # Load query GTF to get chromosome locations
+    gtf = pd.read_csv(query_gtf, sep='\t', comment='#', header=None,
+                      names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
+    genes = gtf[gtf['type'] == 'transcript'].copy()
+    genes['gene_id'] = genes['attributes'].str.extract('transcript_id "([^";]+)"')
+
+    # Map sseqid from BLAST to seqid in GTF
+    merged = blast_df.merge(genes[['gene_id', 'seqid', 'start']], left_on='sseqid', right_on='gene_id', how='left')
+
+    print("\n🧬 Query BLAST Hits Chromosome Summary:\n")
+    chrom_counts = merged['seqid'].value_counts()
+    print(chrom_counts.to_string())
+
+    # Print ordered list
+    print("\n🧭 Order of hits on top query contig:\n")
+    top_chrom = chrom_counts.idxmax()
+    ordered = merged[merged['seqid'] == top_chrom].sort_values(by='start')
+    for _, row in ordered.iterrows():
+        print(f"{row['qseqid']} ➝ {row['sseqid']} on {row['seqid']} @ {row['start']}")
+
+def generate_gggenomes_tracks(blast_file, query_gtf, output_dir, ref_gtf):
+    print("📈 Generating gggenomes tracks...")
+
+    # Load BLAST results
+    cols = ["qseqid", "sseqid", "pident", "length", "mismatch", "gapopen",
+            "qstart", "qend", "sstart", "send", "evalue", "bitscore"]
+    blast_df = pd.read_csv(blast_file, sep="\t", header=None, names=cols)
+
+    # --- Handle QUERY GTF ---
+    query_gtf_path = Path(query_gtf)
+    if not query_gtf_path.suffix == ".gtf":
+        print("🧬 Converting query GFF to GTF format using gffread...")
+        converted_gtf = query_gtf_path.with_suffix(".gtf")
+        subprocess.run([
+            "gffread", str(query_gtf_path), "-T", "-o", str(converted_gtf)
+        ], check=True)
+        query_gtf = str(converted_gtf)
+
+    query_df = pd.read_csv(query_gtf, sep="\t", comment="#", header=None,
+                           names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
+    query_tx = query_df[query_df['type'].isin(['transcript', 'mRNA'])].copy()
+    query_tx['transcript_id'] = query_tx['attributes'].str.extract('transcript_id "?([^";]+)"?')
+    query_tx['gene_name'] = query_tx['attributes'].str.extract('gene_name "?([^";]+)"?')
+    query_tx = query_tx[['transcript_id', 'gene_name', 'seqid', 'start', 'end']].dropna()
+
+    # --- Handle REF GTF ---
+    ref_df = pd.read_csv(ref_gtf, sep="\t", comment="#", header=None,
+                         names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
+    ref_tx = ref_df[ref_df['type'].isin(['transcript', 'mRNA'])].copy()
+    ref_tx['transcript_id'] = ref_tx['attributes'].str.extract('transcript_id "?([^";]+)"?')
+    ref_tx['gene_name'] = ref_tx['attributes'].str.extract('gene_name "?([^";]+)"?')
+    ref_tx = ref_tx[['transcript_id', 'gene_name', 'seqid', 'start', 'end']].dropna()
+
+    # --- Merge BLAST hits with coords ---
+    merged = blast_df.merge(ref_tx, left_on='qseqid', right_on='transcript_id', how='left')\
+                     .merge(query_tx, left_on='sseqid', right_on='transcript_id', how='left',
+                            suffixes=('_ref', '_qry'))
+
+    # --- Coordinate resets ---
+    min_ref = merged['start_ref'].min()
+    min_qry = merged['start_qry'].min()
+    shift_ref = min_ref - 3000 if min_ref > 3000 else 0
+    shift_qry = min_qry - 3000 if min_qry > 3000 else 0
+
+    merged['ref_start'] = merged['start_ref'] - shift_ref
+    merged['ref_end'] = merged['end_ref'] - shift_ref
+    merged['qry_start'] = merged['start_qry'] - shift_qry
+    merged['qry_end'] = merged['end_qry'] - shift_qry
+
+    # --- SEQ track ---
+    seqs_df = pd.concat([
+        merged[['seqid_ref', 'ref_end']].rename(columns={'seqid_ref': 'seq_id', 'ref_end': 'length'}),
+        merged[['seqid_qry', 'qry_end']].rename(columns={'seqid_qry': 'seq_id', 'qry_end': 'length'})
+    ])
+    seqs_df = seqs_df.groupby('seq_id')['length'].max().reset_index()
+    seqs_df['length'] = seqs_df['length'] + 3000  # buffer
+    seqs_df.to_csv(Path(output_dir) / "gggenomes_seqs.tsv", sep='\t', index=False)
+
+    # --- GENE track ---
+    genes_df = pd.concat([
+        merged[['seqid_ref', 'ref_start', 'ref_end', 'transcript_id_ref', 'gene_name_ref']]
+            .rename(columns={
+                'seqid_ref': 'seq_id',
+                'ref_start': 'start',
+                'ref_end': 'end',
+                'transcript_id_ref': 'transcript_id',
+                'gene_name_ref': 'gene_name'
+            }),
+        merged[['seqid_qry', 'qry_start', 'qry_end', 'transcript_id_qry', 'gene_name_qry']]
+            .rename(columns={
+                'seqid_qry': 'seq_id',
+                'qry_start': 'start',
+                'qry_end': 'end',
+                'transcript_id_qry': 'transcript_id',
+                'gene_name_qry': 'gene_name'
+            })
+    ])
+    genes_df.to_csv(Path(output_dir) / "gggenomes_genes.tsv", sep='\t', index=False)
+
+    # --- LINKS track ---
+    links_df = merged.rename(columns={
+        'seqid_ref': 'seq_id',
+        'ref_start': 'start',
+        'ref_end': 'end',
+        'seqid_qry': 'seq_id2',
+        'qry_start': 'start2',
+        'qry_end': 'end2'
+    })[['seq_id', 'start', 'end', 'seq_id2', 'start2', 'end2']]
+    links_df.to_csv(Path(output_dir) / "gggenomes_links.tsv", sep='\t', index=False)
+
+    print("✅ gggenomes files written: seqs.tsv, genes.tsv, links.tsv")
+
+def run_gggenomes_plot(seqs_file, genes_file, links_file, output_pdf):
+    print("🎨 Generating synteny plot with gggenomes...")
+
+    r_script = f"""
+    library(tibble)
+    library(gggenomes)
+
+    # Load input files
+    seqs <- readr::read_tsv("{seqs_file}")
+    genes <- readr::read_tsv("{genes_file}")
+    links <- readr::read_tsv("{links_file}")
+
+    # Generate plot
+    p <- gggenomes(genes=genes, seqs=seqs, links=links) +
+        geom_seq() +
+        geom_seq_label() +
+        geom_gene() +
+        geom_link()
+
+    # Save plot
+    ggplot2::ggsave("{output_pdf}", plot=p, width=10, height=4)
+    """
+
+    # Write R script to temp file
+    tmp_r_path = Path(output_pdf).with_suffix(".plot_gggenomes.R")
+    with open(tmp_r_path, "w") as f:
+        f.write(r_script)
+
+    # Run R script
+    try:
+        subprocess.run(["Rscript", str(tmp_r_path)], check=True)
+        print(f"✅ Synteny plot saved to: {output_pdf}")
+    except subprocess.CalledProcessError:
+        print("❌ Error while running Rscript for gggenomes plot.")
+
+
+def main():
+    args = parse_args()
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    logdir = outdir / "logs"
+    logdir.mkdir(exist_ok=True)
+
+    ref_prot_fasta = outdir / "ref_proteins.fasta"
+    extracted_ref_prot = outdir / "ref_proteins_extracted.fasta"
+    query_prot_fasta = outdir / "query_proteins.fasta"
+    blast_output = outdir / "blastp_results.tsv"
+
+    # Step 1: Generate full protein FASTA from reference
+    run_gffread(args.ref_genome, args.ref_gtf, str(ref_prot_fasta))
+
+    # Step 2: Extract flanking protein IDs
+    ref_ids = args.ref_ids.split(",")
+    all_ids = []
+    for rid in ref_ids:
+        flanks = find_flanking_genes(args.ref_gtf, rid, args.flank_method, args.window)
+        all_ids.extend(flanks)
+    all_ids = list(set(all_ids))
+
+    # Step 3: Extract specific proteins
+    extract_proteins(ref_prot_fasta, all_ids, extracted_ref_prot)
+
+    # Step 4: Generate protein FASTA for query genome (same logic)
+    run_gffread(args.query_genome, args.query_gtf, str(query_prot_fasta))
+
+    # Step 5: Make BLAST DB from query protein set
+    make_blast_db(query_prot_fasta, log_dir=logdir)
+
+    # Step 6: Run blastp
+    run_blastp(extracted_ref_prot, query_prot_fasta, blast_output, log_dir=logdir)
+
+    # Step 7: Report BLAST hit order and contig congruence
+    summarize_query_hits(blast_output, args.query_gtf)
+
+    # Step 8: Create gggenomes input tracks
+    generate_gggenomes_tracks(blast_output, args.query_gtf, outdir, ref_gtf=args.ref_gtf)
+
+    # Step 9: Generate gggenomes synteny plot
+    gg_seq = outdir / "gggenomes_seqs.tsv"
+    gg_genes = outdir / "gggenomes_genes.tsv"
+    gg_links = outdir / "gggenomes_links.tsv"
+    plot_pdf = outdir / "synteny_plot.pdf"
+
+    run_gggenomes_plot(gg_seq, gg_genes, gg_links, plot_pdf)
+
+
+if __name__ == "__main__":
+    main()
