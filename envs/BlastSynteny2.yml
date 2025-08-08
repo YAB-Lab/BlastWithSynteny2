@@ -1,4 +1,4 @@
-name: synteny_ortho_env
+name: BlastSynteny2
 channels:
   - anaconda
   - r
@@ -208,4 +208,4 @@ dependencies:
   - xz-tools=5.8.1=hb9d3cd8_2
   - zlib=1.2.13=h4ab18f5_6
   - zstd=1.5.6=ha6fb4c9_0
-prefix: /home/yahmed/miniforge3/envs/synteny_ortho_env
+prefix: /home/yahmed/miniforge3/envs/BlastSynteny2

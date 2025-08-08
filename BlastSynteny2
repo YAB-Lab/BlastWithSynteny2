@@ -52,18 +52,6 @@ def extract_proteins(input_fasta, id_list, output_fasta):
 
     print(f"✅ Extracted protein sequences saved to {output_fasta}")
 
-
-# def extract_proteins(input_fasta, id_list, output_fasta):
-#     print(f"\n\U0001f50e Extracting specified proteins from {input_fasta}\n")
-#     records = SeqIO.to_dict(SeqIO.parse(input_fasta, "fasta"))
-#     with open(output_fasta, "w") as out_f:
-#         for pid in id_list:
-#             if pid in records:
-#                 SeqIO.write(records[pid], out_f, "fasta")
-#             else:
-#                 print(f"\n\u26a0\ufe0f WARNING: Protein ID '{pid}' not found in {input_fasta}")
-#     print(f"\n\u2705 Extracted protein sequences saved to {output_fasta}\n")
-
 def make_blast_db(fasta, dbtype="prot", log_dir=None):
     print(f"\n\U0001f527 Creating BLAST database for {fasta}\n")
     cmd = [
