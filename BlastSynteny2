@@ -6,6 +6,84 @@ from pathlib import Path
 from Bio import SeqIO
 import pandas as pd
 
+def resolve_genes_to_longest_transcripts(ref_gtf, gene_ids):
+    """
+    Map each gene_id to its longest transcript_id using the reference GTF.
+    Length is computed as transcript/mRNA span (end - start + 1).
+    Returns a list of transcript_ids in the same order as the input gene_ids (deduped).
+    """
+    print("📝 Resolving gene IDs to longest transcript IDs from reference GTF...")
+
+    # Ensure GTF (convert GFF->GTF if needed)
+    gtf_path = Path(ref_gtf)
+    if gtf_path.suffix != ".gtf":
+        print("🧬 Converting reference GFF to GTF via gffread...")
+        converted = gtf_path.with_suffix(".gtf")
+        subprocess.run(["gffread", str(gtf_path), "-T", "-o", str(converted)], check=True)
+        ref_gtf = str(converted)
+
+    # Load GTF
+    cols = ['seqid','source','type','start','end','score','strand','phase','attributes']
+    gtf = pd.read_csv(ref_gtf, sep="\t", comment="#", header=None, names=cols)
+
+    # Keep transcript-like rows
+    tx = gtf[gtf['type'].isin(['transcript','mRNA'])].copy()
+
+    # Extract IDs (return Series via expand=False)
+    tx['transcript_id'] = tx['attributes'].str.extract(r'transcript_id "?([^";]+)"?', expand=False)
+    tx['gene_id_attr']  = tx['attributes'].str.extract(r'gene_name "?([^";]+)"?', expand=False)
+
+    # Fallbacks for gene id (some refs store gene= or gene_name= in attributes)
+    tx['gene_id_attr'] = tx['gene_id_attr'].fillna(
+        tx['attributes'].str.extract(r'gene=([^;]+)', expand=False)
+    )
+    tx['gene_id_attr'] = tx['gene_id_attr'].fillna(
+        tx['attributes'].str.extract(r'gene_name "?([^";]+)"?', expand=False)
+    )
+
+    # Compute transcript span length
+    tx['tx_len'] = (tx['end'] - tx['start'] + 1).astype('Int64')
+
+    # Pick the longest transcript per gene
+    longest_tx = (
+        tx.dropna(subset=['transcript_id','gene_id_attr'])
+          .sort_values(['gene_id_attr', 'tx_len'], ascending=[True, False])
+          .groupby('gene_id_attr', as_index=False)
+          .first()[['gene_id_attr','transcript_id','tx_len']]
+    )
+
+    # Build mapping gene_id -> transcript_id
+    g2t = dict(zip(longest_tx['gene_id_attr'], longest_tx['transcript_id']))
+
+    # Resolve the provided gene_ids in the original order
+    resolved, missing = [], []
+    for gid in gene_ids:
+        if gid in g2t:
+            resolved.append(g2t[gid])
+        else:
+            # light prefix fallback (e.g., some GTFs have "gene-<id>")
+            alt = f"gene-{gid}"
+            if alt in g2t:
+                resolved.append(g2t[alt])
+            else:
+                missing.append(gid)
+
+    print(f"✅ Resolved {len(resolved)} gene IDs to longest transcripts.")
+    if missing:
+        preview = ", ".join(missing[:5])
+        more = " ..." if len(missing) > 5 else ""
+        print(f"⚠️ {len(missing)} gene IDs not found in reference GTF: {preview}{more}")
+
+    # Deduplicate while preserving order
+    seen, resolved_unique = set(), []
+    for tid in resolved:
+        if tid not in seen:
+            seen.add(tid)
+            resolved_unique.append(tid)
+
+    return resolved_unique
+
+
 def run_gffread(genome_fasta, gtf_file, output_protein_fasta):
     print(f"\n\U0001f9ec Running gffread to extract proteins from {gtf_file}\n")
     cmd = [
@@ -123,10 +201,10 @@ def parse_args():
     parser.add_argument("-r", "--ref_genome", required=True, help="Reference genome FASTA file")
     parser.add_argument("-g", "--ref_gtf", required=True, help="Reference genome GTF file")
     parser.add_argument("-i", "--ref_ids", required=True, help="Comma-separated list of reference protein/gene IDs to extract")
+    parser.add_argument("-y", "--id_type", choices=["transcript", "gene"], default="transcript", help="Type of IDs provided to --ref_ids (default: transcript). If 'gene', the longest transcript per gene will be used.")
     parser.add_argument("-q", "--query_genome", required=True, help="Query genome FASTA file")
     parser.add_argument("-t", "--query_gtf", required=True, help="Query GTF file")
     parser.add_argument("-o", "--outdir", required=True, help="Directory to save all outputs")
-
     parser.add_argument("-m", "--flank_method", choices=["gene", "bp"], default="gene", help="Flanking extraction method: 'gene' or 'bp' distance")
     parser.add_argument("-w", "--window", type=int, default=5, help="Window size for flanking region (n genes or base pairs)")
     parser.add_argument("--export_gff3_regions", action="store_true", help="Export reference and query regions as GFF3 with embedded FASTA for Geneious")
@@ -283,8 +361,7 @@ def run_gggenomes_plot(seqs_file, genes_file, links_file, output_pdf):
         geom_seq() +
         geom_seq_label() +
         geom_gene_tag(aes(label=gene_name), nudge_y=0.1, check_overlap = TRUE) +
-        geom_gene(aes(fill=gene_name), alpha = 0.3) +
-        scale_fill_brewer("Genes", palette="Dark2", na.value="cornsilk3")
+        geom_gene(aes(fill=gene_name), alpha = 0.3) 
 
     # Save plot
     ggplot2::ggsave("{output_pdf}", plot=p, width=10, height=4)
@@ -449,7 +526,15 @@ def main():
     run_gffread(args.ref_genome, args.ref_gtf, str(ref_prot_fasta))
 
     # Step 2: Extract flanking protein IDs
-    ref_ids = args.ref_ids.split(",")
+    ref_ids_raw = [x.strip() for x in args.ref_ids.split(",") if x.strip()]
+
+    if args.id_type == "gene":
+        # Convert gene IDs → longest transcript IDs from ref GTF
+        ref_ids = resolve_genes_to_longest_transcripts(args.ref_gtf, ref_ids_raw)
+    else:
+        # Use as-is (transcript IDs)
+        ref_ids = ref_ids_raw
+
     all_ids = []
     for rid in ref_ids:
         flanks = find_flanking_genes(args.ref_gtf, rid, args.flank_method, args.window)
