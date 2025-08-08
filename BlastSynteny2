@@ -6,11 +6,11 @@ from pathlib import Path
 from Bio import SeqIO
 import pandas as pd
 
-def resolve_genes_to_longest_transcripts(ref_gtf, gene_ids):
+def resolve_genes_to_longest_transcripts(ref_gtf, gene_names):
     """
-    Map each gene_id to its longest transcript_id using the reference GTF.
+    Map each gene_name to its longest transcript_id using the reference GTF.
     Length is computed as transcript/mRNA span (end - start + 1).
-    Returns a list of transcript_ids in the same order as the input gene_ids (deduped).
+    Returns a list of transcript_ids in the same order as the input gene_names (deduped).
     """
     print("📝 Resolving gene IDs to longest transcript IDs from reference GTF...")
 
@@ -31,13 +31,13 @@ def resolve_genes_to_longest_transcripts(ref_gtf, gene_ids):
 
     # Extract IDs (return Series via expand=False)
     tx['transcript_id'] = tx['attributes'].str.extract(r'transcript_id "?([^";]+)"?', expand=False)
-    tx['gene_id_attr']  = tx['attributes'].str.extract(r'gene_name "?([^";]+)"?', expand=False)
+    tx['gene_name_attr']  = tx['attributes'].str.extract(r'gene_name "?([^";]+)"?', expand=False)
 
     # Fallbacks for gene id (some refs store gene= or gene_name= in attributes)
-    tx['gene_id_attr'] = tx['gene_id_attr'].fillna(
+    tx['gene_name_attr'] = tx['gene_name_attr'].fillna(
         tx['attributes'].str.extract(r'gene=([^;]+)', expand=False)
     )
-    tx['gene_id_attr'] = tx['gene_id_attr'].fillna(
+    tx['gene_name_attr'] = tx['gene_name_attr'].fillna(
         tx['attributes'].str.extract(r'gene_name "?([^";]+)"?', expand=False)
     )
 
@@ -46,18 +46,18 @@ def resolve_genes_to_longest_transcripts(ref_gtf, gene_ids):
 
     # Pick the longest transcript per gene
     longest_tx = (
-        tx.dropna(subset=['transcript_id','gene_id_attr'])
-          .sort_values(['gene_id_attr', 'tx_len'], ascending=[True, False])
-          .groupby('gene_id_attr', as_index=False)
-          .first()[['gene_id_attr','transcript_id','tx_len']]
+        tx.dropna(subset=['transcript_id','gene_name_attr'])
+          .sort_values(['gene_name_attr', 'tx_len'], ascending=[True, False])
+          .groupby('gene_name_attr', as_index=False)
+          .first()[['gene_name_attr','transcript_id','tx_len']]
     )
 
-    # Build mapping gene_id -> transcript_id
-    g2t = dict(zip(longest_tx['gene_id_attr'], longest_tx['transcript_id']))
+    # Build mapping gene_name -> transcript_id
+    g2t = dict(zip(longest_tx['gene_name_attr'], longest_tx['transcript_id']))
 
-    # Resolve the provided gene_ids in the original order
+    # Resolve the provided gene_names in the original order
     resolved, missing = [], []
-    for gid in gene_ids:
+    for gid in gene_names:
         if gid in g2t:
             resolved.append(g2t[gid])
         else:
@@ -166,15 +166,15 @@ def find_flanking_genes(gtf_file, target_id, method, window, verbose=True):
     gtf = pd.read_csv(gtf_file, sep='\t', comment='#', header=None,
                       names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
     genes = gtf[gtf['type'].isin(['transcript', 'mRNA'])].copy()
-    genes['gene_id'] = genes['attributes'].str.extract('transcript_id "([^"]+)"')
-    genes = genes.dropna(subset=['gene_id']).reset_index(drop=True)
+    genes['gene_name'] = genes['attributes'].str.extract('transcript_id "([^"]+)"')
+    genes = genes.dropna(subset=['gene_name']).reset_index(drop=True)
     genes = genes.sort_values(by=['seqid', 'start']).reset_index(drop=True)
 
-    if target_id not in genes['gene_id'].values:
+    if target_id not in genes['gene_name'].values:
         print(f"\n\u26a0\ufe0f Target ID '{target_id}' not found in GTF.\n")
         return []
 
-    idx = genes[genes['gene_id'] == target_id].index[0]
+    idx = genes[genes['gene_name'] == target_id].index[0]
 
     if method == 'gene':
         upstream = genes.iloc[max(0, idx-window):idx]
@@ -188,7 +188,7 @@ def find_flanking_genes(gtf_file, target_id, method, window, verbose=True):
     else:
         raise ValueError("Method must be 'gene' or 'bp'")
 
-    flank_ids = list(upstream['gene_id']) + [target_id] + list(downstream['gene_id'])
+    flank_ids = list(upstream['gene_name']) + [target_id] + list(downstream['gene_name'])
 
     if verbose:
         print(f"\n\U0001f4cb Found {len(upstream)} upstream and {len(downstream)} downstream transcripts.\n")
@@ -235,10 +235,10 @@ def summarize_query_hits(blast_file, query_gtf):
     gtf = pd.read_csv(query_gtf, sep='\t', comment='#', header=None,
                       names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
     genes = gtf[gtf['type'] == 'transcript'].copy()
-    genes['gene_id'] = genes['attributes'].str.extract('transcript_id "([^";]+)"')
+    genes['gene_name'] = genes['attributes'].str.extract('transcript_id "([^";]+)"')
 
     # Map sseqid from BLAST to seqid in GTF
-    merged = blast_df.merge(genes[['gene_id', 'seqid', 'start']], left_on='sseqid', right_on='gene_id', how='left')
+    merged = blast_df.merge(genes[['gene_name', 'seqid', 'start']], left_on='sseqid', right_on='gene_name', how='left')
 
     print("\n🧬 Query BLAST Hits Chromosome Summary:\n")
     chrom_counts = merged['seqid'].value_counts()
@@ -251,97 +251,126 @@ def summarize_query_hits(blast_file, query_gtf):
     for _, row in ordered.iterrows():
         print(f"{row['qseqid']} ➝ {row['sseqid']} on {row['seqid']} @ {row['start']}")
 
-def generate_gggenomes_tracks(blast_file, query_gtf, output_dir, ref_gtf):
-    print("📈 Generating gggenomes tracks...")
+def generate_gggenomes_tracks(blast_file, query_gtf, output_dir, ref_gtf, padding=3000):
+    print("📈 Generating gggenomes tracks (including all neighbor transcripts)...")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
 
     # Load BLAST results
-    cols = ["qseqid", "sseqid", "pident", "length", "mismatch", "gapopen",
-            "qstart", "qend", "sstart", "send", "evalue", "bitscore"]
-    blast_df = pd.read_csv(blast_file, sep="\t", header=None, names=cols)
+    cols = ["qseqid","sseqid","pident","length","mismatch","gapopen",
+            "qstart","qend","sstart","send","evalue","bitscore"]
+    b = pd.read_csv(blast_file, sep="\t", header=None, names=cols)
 
-    # --- Handle QUERY GTF ---
-    query_gtf_path = Path(query_gtf)
-    if not query_gtf_path.suffix == ".gtf":
-        print("🧬 Converting query GFF to GTF format using gffread...")
-        converted_gtf = query_gtf_path.with_suffix(".gtf")
-        subprocess.run([
-            "gffread", str(query_gtf_path), "-T", "-o", str(converted_gtf)
-        ], check=True)
-        query_gtf = str(converted_gtf)
+    # Ensure GTF (convert GFF->GTF if needed)
+    def ensure_gtf(path_str):
+        p = Path(path_str)
+        if p.suffix != ".gtf":
+            print(f"🧬 Converting {p.name} to GTF via gffread ...")
+            conv = p.with_suffix(".gtf")
+            subprocess.run(["gffread", str(p), "-T", "-o", str(conv)], check=True)
+            return str(conv)
+        return path_str
 
-    query_df = pd.read_csv(query_gtf, sep="\t", comment="#", header=None,
-                           names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
-    query_tx = query_df[query_df['type'].isin(['transcript', 'mRNA'])].copy()
-    query_tx['transcript_id'] = query_tx['attributes'].str.extract('transcript_id "?([^";]+)"?')
-    query_tx['gene_name'] = query_tx['attributes'].str.extract('gene_name "?([^";]+)"?')
-    query_tx = query_tx[['transcript_id', 'gene_name', 'seqid', 'start', 'end']].dropna()
+    query_gtf = ensure_gtf(query_gtf)
+    ref_gtf   = ensure_gtf(ref_gtf)
 
-    # --- Handle REF GTF ---
-    ref_df = pd.read_csv(ref_gtf, sep="\t", comment="#", header=None,
-                         names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
-    ref_tx = ref_df[ref_df['type'].isin(['transcript', 'mRNA'])].copy()
-    ref_tx['transcript_id'] = ref_tx['attributes'].str.extract('transcript_id "?([^";]+)"?')
-    ref_tx['gene_name'] = ref_tx['attributes'].str.extract('gene_name "?([^";]+)"?')
-    ref_tx = ref_tx[['transcript_id', 'gene_name', 'seqid', 'start', 'end']].dropna()
+    # Load annotations
+    cols_gtf = ['seqid','source','type','start','end','score','strand','phase','attributes']
+    qdf = pd.read_csv(query_gtf, sep="\t", comment="#", header=None, names=cols_gtf)
+    rdf = pd.read_csv(ref_gtf,   sep="\t", comment="#", header=None, names=cols_gtf)
 
-    # --- Merge BLAST hits with coords ---
-    merged = blast_df.merge(ref_tx, left_on='qseqid', right_on='transcript_id', how='left')\
-                     .merge(query_tx, left_on='sseqid', right_on='transcript_id', how='left',
-                            suffixes=('_ref', '_qry'))
+    # Build transcript tables (support 'transcript' or 'mRNA')
+    def tx_table(df):
+        tx = df[df['type'].isin(['transcript','mRNA'])].copy()
+        tx['transcript_id'] = tx['attributes'].str.extract(r'transcript_id "?([^";]+)"?', expand=False)
+        tx['gene_name']       = tx['attributes'].str.extract(r'gene_name "?([^";]+)"?',       expand=False)
+        # fallbacks if present (GFF-like)
+        tx['gene_name'] = tx['gene_name'].fillna(tx['attributes'].str.extract(r'gene=([^;]+)', expand=False))
+        return tx[['transcript_id','gene_name','seqid','start','end']].dropna(subset=['transcript_id'])
 
-    # --- Coordinate resets ---
-    min_ref = merged['start_ref'].min()
-    min_qry = merged['start_qry'].min()
-    shift_ref = min_ref - 3000 if min_ref > 3000 else 0
-    shift_qry = min_qry - 3000 if min_qry > 3000 else 0
+    qtx = tx_table(qdf)
+    rtx = tx_table(rdf)
 
-    merged['ref_start'] = merged['start_ref'] - shift_ref
-    merged['ref_end'] = merged['end_ref'] - shift_ref
-    merged['qry_start'] = merged['start_qry'] - shift_qry
-    merged['qry_end'] = merged['end_qry'] - shift_qry
+    # Merge BLAST to get coordinates for ref (qseqid) and query (sseqid)
+    m = (b.merge(rtx, left_on="qseqid", right_on="transcript_id", how="left")
+           .merge(qtx, left_on="sseqid", right_on="transcript_id", how="left",
+                  suffixes=("_ref","_qry")))
 
-    # --- SEQ track ---
-    seqs_df = pd.concat([
-        merged[['seqid_ref', 'ref_end']].rename(columns={'seqid_ref': 'seq_id', 'ref_end': 'length'}),
-        merged[['seqid_qry', 'qry_end']].rename(columns={'seqid_qry': 'seq_id', 'qry_end': 'length'})
-    ])
-    seqs_df = seqs_df.groupby('seq_id')['length'].max().reset_index()
-    seqs_df['length'] = seqs_df['length'] + 3000  # buffer
-    seqs_df.to_csv(Path(output_dir) / "gggenomes_seqs.tsv", sep='\t', index=False)
+    # Pick dominant contigs (most hits)
+    def top_contig(series):
+        vc = series.value_counts()
+        return vc.index[0] if not vc.empty else None
 
-    # --- GENE track ---
-    genes_df = pd.concat([
-        merged[['seqid_ref', 'ref_start', 'ref_end', 'transcript_id_ref', 'gene_name_ref']]
-            .rename(columns={
-                'seqid_ref': 'seq_id',
-                'ref_start': 'start',
-                'ref_end': 'end',
-                'transcript_id_ref': 'transcript_id',
-                'gene_name_ref': 'gene_name'
-            }),
-        merged[['seqid_qry', 'qry_start', 'qry_end', 'transcript_id_qry', 'gene_name_qry']]
-            .rename(columns={
-                'seqid_qry': 'seq_id',
-                'qry_start': 'start',
-                'qry_end': 'end',
-                'transcript_id_qry': 'transcript_id',
-                'gene_name_qry': 'gene_name'
-            })
-    ])
-    genes_df.to_csv(Path(output_dir) / "gggenomes_genes.tsv", sep='\t', index=False)
+    ref_contig = top_contig(m['seqid_ref'])
+    qry_contig = top_contig(m['seqid_qry'])
+    if ref_contig is None or qry_contig is None:
+        print("⚠️ Could not determine dominant contigs from BLAST+GTF. Skipping gggenomes track generation.")
+        return
 
-    # --- LINKS track ---
-    links_df = merged.rename(columns={
-        'seqid_ref': 'seq_id',
-        'ref_start': 'start',
-        'ref_end': 'end',
-        'seqid_qry': 'seq_id2',
-        'qry_start': 'start2',
-        'qry_end': 'end2'
-    })[['seq_id', 'start', 'end', 'seq_id2', 'start2', 'end2']]
-    links_df.to_csv(Path(output_dir) / "gggenomes_links.tsv", sep='\t', index=False)
+    # Compute region bounds (min..max of hit coords) + padding
+    ref_start = max(0, int(m.loc[m['seqid_ref']==ref_contig, 'start_ref'].min()) - padding)
+    ref_end   = int(m.loc[m['seqid_ref']==ref_contig, 'end_ref'].max()) + padding
+    qry_start = max(0, int(m.loc[m['seqid_qry']==qry_contig, 'start_qry'].min()) - padding)
+    qry_end   = int(m.loc[m['seqid_qry']==qry_contig, 'end_qry'].max()) + padding
 
-    print("✅ gggenomes files written: seqs.tsv, genes.tsv, links.tsv")
+    # Subset ALL transcripts in those regions (not just hit ones)
+    q_all = qtx[(qtx['seqid']==qry_contig) & (qtx['end']>=qry_start) & (qtx['start']<=qry_end)].copy()
+    r_all = rtx[(rtx['seqid']==ref_contig) & (rtx['end']>=ref_start) & (rtx['start']<=ref_end)].copy()
+
+    # Shift coordinates so regions start at 0 (gggenomes-friendly)
+    q_shift = qry_start
+    r_shift = ref_start
+    q_all['start'] = (q_all['start'] - q_shift).clip(lower=0)
+    q_all['end']   = (q_all['end']   - q_shift).clip(lower=0)
+    r_all['start'] = (r_all['start'] - r_shift).clip(lower=0)
+    r_all['end']   = (r_all['end']   - r_shift).clip(lower=0)
+
+    # Build seq track: 2 sequences (ref & query regions)
+    # Use informative names so they’re distinct in plot
+    ref_region_id = f"ref::{ref_contig}"
+    qry_region_id = f"qry::{qry_contig}"
+    seqs = pd.DataFrame({
+        "seq_id": [ref_region_id, qry_region_id],
+        "length": [max(int(r_all['end'].max()), 1), max(int(q_all['end'].max()), 1)]
+    })
+    seqs.to_csv(output_dir / "gggenomes_seqs.tsv", sep="\t", index=False)
+
+    # Build genes track: include ALL transcripts in region (ref + query)
+    genes_ref = r_all.rename(columns={"seqid":"_drop"}).copy()
+    genes_ref['seq_id'] = ref_region_id
+    genes_ref = genes_ref[['seq_id','start','end','transcript_id','gene_name']]
+
+    genes_qry = q_all.rename(columns={"seqid":"_drop"}).copy()
+    genes_qry['seq_id'] = qry_region_id
+    genes_qry = genes_qry[['seq_id','start','end','transcript_id','gene_name']]
+
+    genes = pd.concat([genes_ref, genes_qry], ignore_index=True)
+    genes.to_csv(output_dir / "gggenomes_genes.tsv", sep="\t", index=False)
+
+    # Build links track: only BLAST-hit pairs (shifted coords)
+    links = (m[(m['seqid_ref']==ref_contig) & (m['seqid_qry']==qry_contig)]
+               .copy())
+
+    # Shift the hit coords too
+    links['start_ref_s'] = (links['start_ref'] - r_shift).clip(lower=0)
+    links['end_ref_s']   = (links['end_ref']   - r_shift).clip(lower=0)
+    links['start_qry_s'] = (links['start_qry'] - q_shift).clip(lower=0)
+    links['end_qry_s']   = (links['end_qry']   - q_shift).clip(lower=0)
+
+    links_out = links.rename(columns={
+        'start_ref_s':'start',
+        'end_ref_s':'end',
+        'start_qry_s':'start2',
+        'end_qry_s':'end2'
+    })
+    links_out['seq_id']  = ref_region_id
+    links_out['seq_id2'] = qry_region_id
+    links_out = links_out[['seq_id','start','end','seq_id2','start2','end2']]
+    links_out.to_csv(output_dir / "gggenomes_links.tsv", sep="\t", index=False)
+
+    print("✅ gggenomes files written (with neighbors): seqs.tsv, genes.tsv, links.tsv")
+
 
 def run_gggenomes_plot(seqs_file, genes_file, links_file, output_pdf):
     print("🎨 Generating synteny plot with gggenomes...")
@@ -414,8 +443,8 @@ def export_region_gff3_with_fasta(
     def tx_table(df):
         tx = df[df['type'].isin(['transcript','mRNA'])].copy()
         tx['transcript_id'] = tx['attributes'].str.extract(r'transcript_id "?([^";]+)"?')
-        tx['gene_id']       = tx['attributes'].str.extract(r'gene_id "?([^";]+)"?')
-        return tx[['transcript_id','gene_id','seqid','start','end']].dropna()
+        tx['gene_name']       = tx['attributes'].str.extract(r'gene_name "?([^";]+)"?')
+        return tx[['transcript_id','gene_name','seqid','start','end']].dropna()
 
     ref_tx = tx_table(ref_df)
     qry_tx = tx_table(qry_df)
