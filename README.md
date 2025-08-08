@@ -45,3 +45,7 @@ options:
   --export_gff3_regions
                         Export reference and query regions as GFF3 with embedded FASTA for Geneious
 ```
+
+### Example:
+
+In this example we will look for the syntenic region from _D. melangoaster_ in the genome of _D. ananassae_.
